@@ -1,0 +1,31 @@
+[Unit]
+Description=Drone detection dashboard (polls Kismet REST API)
+After=network-online.target kismet.service
+Wants=network-online.target
+# Don't fail if kismet isn't up yet — server.py shows a nice error in the UI
+# and self-recovers on next poll.
+
+[Service]
+Type=simple
+User=grant
+Group=kismet
+WorkingDirectory=/opt/drone-dashboard
+Environment=PYTHONUNBUFFERED=1
+Environment="HTTP_HOST=0.0.0.0"
+Environment="HTTP_PORT=8081"
+Environment="KISMET_URL=http://localhost:2501"
+Environment="POLL_SECS=5"
+Environment="SQLITE_DB=/var/lib/drone-dashboard/operators.db"
+# To enable ntfy push notifications: pick a hard-to-guess topic name and set:
+#   sudo systemctl edit drone-dashboard
+# add: Environment="NTFY_URL=https://ntfy.sh/your-secret-topic-here"
+Environment="NTFY_URL="
+Environment="NTFY_RSSI_THRESHOLD=-60"
+ExecStart=/usr/bin/python3 /opt/drone-dashboard/server.py
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

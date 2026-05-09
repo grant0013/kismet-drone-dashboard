@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.venv/
+venv/
+env/
+.eggs/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Local dev
+*.log
+*.pid
+
+# Persistent state — never commit operator data!
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+operators.db
+data/
+
+# Local config that shouldn't go to public repo
+config.env
+config.local.*
+.env
+.env.local
+
+# Backups created by install.sh
+*.bak
+*.bak.[0-9]*
