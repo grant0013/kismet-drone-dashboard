@@ -4,6 +4,7 @@ A focused live dashboard for **drone detection** built on top of [Kismet](https:
 
 - 🚁 **Drones** detected via Kismet's UAV phy + extended UK police/enterprise pattern matching
 - 👤 **Operator IDs** logged to SQLite — country flags, format validation, UK organisation pattern matching, persistent sightings, editable notes
+- 📶 **Capture Sources** — auto-discovers available WiFi + Bluetooth adapters, shows monitor-mode capability + NetworkManager state, lets you add/stop Kismet sources live with one click (refuses to touch your management interface)
 - 🗺️ **Live map** plotting drone GPS + operator GPS from Remote ID broadcasts (Leaflet + OpenStreetMap)
 - 📡 **WiFi clients** + 🔵 **Bluetooth devices** with vendor inference, BT5 LE Privacy detection, BT SIG company ID lookup
 - 🔔 Optional **ntfy push notifications** when a new operator appears or a drone is overhead (RSSI threshold)

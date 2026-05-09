@@ -30,6 +30,8 @@ import os
 import logging
 import sqlite3
 import json
+import subprocess
+import shutil
 from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
@@ -980,6 +982,260 @@ def api_health():
         return jsonify({"ok": _state["kismet_ok"], "last_poll": _state["last_poll"]})
 
 
+# -----------------------------------------------------------------------------
+# Adapter discovery & live source management
+# Reads system state via iw/bluetoothctl/nmcli/ip; mutates Kismet via its REST API.
+
+def _which(*candidates):
+    for c in candidates:
+        p = shutil.which(c)
+        if p:
+            return p
+    return None
+
+
+def _run(cmd, timeout=5):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout).stdout
+    except Exception as e:
+        log.debug("cmd failed %s: %s", cmd, e)
+        return ""
+
+
+def _wifi_phys():
+    """Parse `iw dev` → list of {phy, iface, type, addr, ssid?, channel?}."""
+    iw = _which("iw", "/usr/sbin/iw")
+    if not iw:
+        return []
+    out = _run([iw, "dev"])
+    devices, current = [], {}
+    cur_phy = None
+    for line in out.splitlines():
+        s = line.strip()
+        if line.startswith("phy#"):
+            cur_phy = int(line[4:].strip())
+        elif s.startswith("Interface "):
+            if current:
+                devices.append(current)
+            current = {"phy": cur_phy, "iface": s.split(None, 1)[1], "type": "?", "addr": ""}
+        elif s.startswith("addr "):
+            current["addr"] = s.split(None, 1)[1]
+        elif s.startswith("type "):
+            current["type"] = s.split(None, 1)[1]
+        elif s.startswith("ssid "):
+            current["ssid"] = s.split(None, 1)[1]
+        elif s.startswith("channel "):
+            current["channel"] = s.split("channel", 1)[1].split("(", 1)[0].strip()
+    if current:
+        devices.append(current)
+    # Annotate each with monitor-mode capability + bands
+    for d in devices:
+        info = _run([iw, "phy", f"phy{d['phy']}", "info"])
+        d["monitor_capable"] = " * monitor" in info or "* monitor\n" in info
+        d["bands"] = []
+        for line in info.splitlines():
+            if line.strip().startswith("Band "):
+                d["bands"].append(line.strip().rstrip(":"))
+    return devices
+
+
+def _hci_to_mac():
+    """Map hciN → BD Address via hciconfig (sysfs `/address` doesn't exist on
+    every kernel — hciconfig is the reliable path)."""
+    hciconfig = _which("hciconfig", "/usr/bin/hciconfig")
+    if not hciconfig:
+        return {}
+    out = _run([hciconfig])
+    result = {}
+    cur = None
+    for line in out.splitlines():
+        # "hci1:\tType: Primary  Bus: USB"
+        if line and not line[0].isspace() and ":" in line:
+            cur = line.split(":", 1)[0].strip()
+        elif cur and "BD Address:" in line:
+            mac = line.split("BD Address:", 1)[1].split()[0].strip().upper()
+            result[cur] = mac
+    return result
+
+
+def _bt_controllers():
+    """Enumerate BT controllers from hciconfig + cross-reference bluetoothctl
+    for default/name/powered status. Returns [{hci, mac, name, default, powered}]."""
+    hci_macs = _hci_to_mac()  # {'hci0': 'B8:27:...', 'hci1': '00:E0:...'}
+    if not hci_macs:
+        return []
+
+    # Pull bluetoothctl info for friendly name + default flag (best-effort)
+    btctl_info = {}  # mac → {name, default}
+    out = _run(["bluetoothctl", "list"])
+    for line in out.splitlines():
+        if line.startswith("Controller "):
+            parts = line.split()
+            if len(parts) >= 2:
+                mac = parts[1].upper()
+                rest = line.split(None, 2)[2] if len(parts) >= 3 else ""
+                btctl_info[mac] = {
+                    "name": rest.replace("[default]", "").strip(),
+                    "default": "[default]" in rest,
+                }
+
+    controllers = []
+    for hci, mac in sorted(hci_macs.items()):
+        info = btctl_info.get(mac, {})
+        controllers.append({
+            "hci": hci,
+            "mac": mac,
+            "name": info.get("name", ""),
+            "default": info.get("default", False),
+            "powered": _bt_powered(mac),
+        })
+    return controllers
+
+
+def _bt_powered(mac):
+    """Check if a controller is powered on via bluetoothctl."""
+    if not mac:
+        return False
+    out = _run(["bluetoothctl", "show", mac], timeout=3)
+    for line in out.splitlines():
+        if line.strip().startswith("Powered:"):
+            return line.strip().endswith("yes")
+    return False
+
+
+def _default_route_iface():
+    """Identifies the management interface (default gateway) — DON'T touch this."""
+    out = _run(["ip", "-o", "route"])
+    for line in out.splitlines():
+        if line.startswith("default "):
+            parts = line.split()
+            if "dev" in parts:
+                return parts[parts.index("dev") + 1]
+    return ""
+
+
+def _nm_status():
+    """Parse `nmcli -t -f DEVICE,TYPE,STATE device` → {iface: state}."""
+    out = _run(["nmcli", "-t", "-f", "DEVICE,TYPE,STATE", "device"])
+    result = {}
+    for line in out.splitlines():
+        parts = line.split(":")
+        if len(parts) >= 3:
+            result[parts[0]] = {"type": parts[1], "state": parts[2]}
+    return result
+
+
+def _kismet_active_sources():
+    """Pull live Kismet datasource list."""
+    try:
+        r = requests.get(f"{KISMET_URL}/datasource/all_sources.json", auth=AUTH, timeout=5)
+        r.raise_for_status()
+        srcs = r.json()
+        out = []
+        for s in srcs:
+            out.append({
+                "name": s.get("kismet.datasource.name"),
+                "iface": s.get("kismet.datasource.interface"),
+                "uuid": s.get("kismet.datasource.uuid"),
+                "running": bool(s.get("kismet.datasource.running")),
+                "type": (s.get("kismet.datasource.type_driver") or {}).get("kismet.datasource.type_driver.type"),
+                "hop": bool(s.get("kismet.datasource.hopping")),
+                "channel": s.get("kismet.datasource.channel"),
+            })
+        return out
+    except Exception as e:
+        log.warning("Kismet sources fetch failed: %s", e)
+        return []
+
+
+@app.route("/api/sources")
+def api_sources():
+    """Discover available adapters and current Kismet sources."""
+    wifi_phys = _wifi_phys()
+    bt = _bt_controllers()
+    mgmt = _default_route_iface()
+    nm = _nm_status()
+    kismet_sources = _kismet_active_sources()
+
+    # Mark each adapter with current Kismet status + safety flags
+    in_use_ifaces = {s["iface"]: s for s in kismet_sources if s.get("iface")}
+
+    for w in wifi_phys:
+        iface = w["iface"]
+        w["is_mgmt"] = (iface == mgmt)
+        w["nm_state"] = (nm.get(iface) or {}).get("state", "unknown")
+        w["in_kismet"] = iface in in_use_ifaces
+        w["kismet_source"] = in_use_ifaces.get(iface) if w["in_kismet"] else None
+        # Suggested kismet source line for kismet_site.conf
+        w["suggested_source"] = f"source={iface}:type=linuxwifi,name={iface}-monitor"
+
+    for b in bt:
+        hci = b.get("hci") or ""
+        b["in_kismet"] = hci in in_use_ifaces
+        b["kismet_source"] = in_use_ifaces.get(hci) if b["in_kismet"] else None
+        b["suggested_source"] = f"source={hci}:type=linuxbluetooth,name={hci}-monitor,active=true" if hci else ""
+
+    return jsonify({
+        "kismet_sources": kismet_sources,
+        "wifi": wifi_phys,
+        "bluetooth": bt,
+        "mgmt_iface": mgmt,
+        "nm_managed": nm,
+    })
+
+
+@app.route("/api/sources/add", methods=["POST"])
+def api_source_add():
+    """Add a source live to Kismet (NOT persistent across kismet restarts).
+    Refuses to use the management interface to avoid breaking SSH.
+    """
+    data = request.get_json(silent=True) or {}
+    src = data.get("definition", "").strip()
+    if not src or "type=" not in src:
+        return jsonify({"error": "missing or malformed source definition"}), 400
+    mgmt = _default_route_iface()
+    if mgmt and src.split(":", 1)[0] == mgmt:
+        return jsonify({"error": f"refusing to add management interface '{mgmt}' — this would kill SSH"}), 400
+    try:
+        r = requests.post(
+            f"{KISMET_URL}/datasource/add_source.cmd",
+            data={"json": json.dumps({"definition": src})},
+            auth=AUTH, timeout=15,
+        )
+        return jsonify({"ok": r.ok, "status": r.status_code,
+                        "kismet_response": r.text[:500]})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/sources/<src_uuid>/close", methods=["POST"])
+def api_source_close(src_uuid):
+    """Close (stop) a Kismet source by UUID. Live, non-persistent."""
+    try:
+        r = requests.post(
+            f"{KISMET_URL}/datasource/by-uuid/{src_uuid}/close_source.cmd",
+            auth=AUTH, timeout=10,
+        )
+        return jsonify({"ok": r.ok, "status": r.status_code,
+                        "kismet_response": r.text[:500]})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/sources/<src_uuid>/open", methods=["POST"])
+def api_source_open(src_uuid):
+    """Re-open a previously closed Kismet source by UUID."""
+    try:
+        r = requests.post(
+            f"{KISMET_URL}/datasource/by-uuid/{src_uuid}/open_source.cmd",
+            auth=AUTH, timeout=10,
+        )
+        return jsonify({"ok": r.ok, "status": r.status_code,
+                        "kismet_response": r.text[:500]})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/operators")
 def api_operators():
     rows = list_operators()
@@ -1137,6 +1393,11 @@ TEMPLATE = r"""
   <section class="full">
     <h2>👤 Drone Operators <span class="count zero" id="op-count">0</span> <span style="font-weight:normal; text-transform:none; color:var(--muted); font-size:11px;">(persistent log — survives reboots)</span></h2>
     <div id="operator-list"><div class="empty">No Operator IDs logged yet. Persistent SQLite log builds up as drones broadcast Remote ID over time.</div></div>
+  </section>
+
+  <section class="full">
+    <h2>📶 Capture Sources <span class="count zero" id="src-count">0</span> <span style="font-weight:normal; text-transform:none; color:var(--muted); font-size:11px;">(live state — changes here are not saved across Kismet restarts)</span></h2>
+    <div id="sources-panel"><div class="empty">Loading adapters…</div></div>
   </section>
 
   <section class="full">
@@ -1407,6 +1668,163 @@ function categoryColour(cat) {
   }[cat] || '#8b949e');
 }
 
+// ----- Capture Sources panel -----
+async function renderSources() {
+  try {
+    const r = await fetch('/api/sources');
+    const s = await r.json();
+    const wifi = s.wifi || [];
+    const bt = s.bluetooth || [];
+    const ks = s.kismet_sources || [];
+    const mgmt = s.mgmt_iface || '';
+
+    document.getElementById('src-count').textContent = ks.length;
+    document.getElementById('src-count').classList.toggle('zero', ks.length === 0);
+
+    const wifiRows = wifi.map(w => {
+      const inUse = w.in_kismet;
+      const monitor = w.monitor_capable;
+      const isMgmt = w.is_mgmt;
+      let status, action;
+      if (isMgmt) {
+        status = '<span class="badge" style="background:var(--bad);color:#fff">MGMT — leave alone</span>';
+        action = '<span style="color:var(--muted)">(SSH path)</span>';
+      } else if (inUse) {
+        status = `<span class="badge" style="background:var(--good);color:#fff">capturing as ${escapeHtml(w.kismet_source.name)}</span>`;
+        action = `<button class="btn-stop" data-uuid="${escapeHtml(w.kismet_source.uuid)}">Stop</button>`;
+      } else if (!monitor) {
+        status = '<span class="badge" style="background:var(--border)">no monitor mode</span>';
+        action = '<span style="color:var(--muted)">incompatible</span>';
+      } else if (w.nm_state === 'connected') {
+        status = `<span class="badge" style="background:var(--warn);color:#000">in use by NetworkManager</span>`;
+        action = `<button class="btn-add" data-def="${escapeHtml(w.suggested_source)}" disabled title="NM manages this interface — set unmanaged first">Add</button>`;
+      } else {
+        status = '<span class="badge" style="background:var(--accent);color:#fff">available</span>';
+        action = `<button class="btn-add" data-def="${escapeHtml(w.suggested_source)}">Add to Kismet</button>`;
+      }
+      const phyBadge = `<span class="badge">phy${w.phy}</span>`;
+      const bandBadge = (w.bands || []).length
+        ? `<span class="badge" style="background:var(--accent);color:#fff">${(w.bands||[]).length} band${w.bands.length>1?'s':''}</span>`
+        : '<span class="badge">single-band</span>';
+      const monBadge = monitor
+        ? '<span class="badge" style="background:var(--good);color:#fff">monitor ✓</span>'
+        : '<span class="badge" style="background:var(--border)">monitor ✗</span>';
+      return `<tr>
+        <td><b>${escapeHtml(w.iface)}</b> ${phyBadge}</td>
+        <td class="mac">${escapeHtml(w.addr || '—')}</td>
+        <td>${escapeHtml(w.type || '?')}</td>
+        <td>${monBadge} ${bandBadge}</td>
+        <td>${status}</td>
+        <td>${action}</td>
+      </tr>`;
+    }).join('');
+
+    const btRows = bt.map(b => {
+      const inUse = b.in_kismet;
+      let status, action;
+      if (!b.hci) {
+        status = '<span class="badge" style="background:var(--border)">no hci device</span>';
+        action = '—';
+      } else if (inUse) {
+        status = `<span class="badge" style="background:var(--good);color:#fff">capturing as ${escapeHtml(b.kismet_source.name)}</span>`;
+        action = `<button class="btn-stop" data-uuid="${escapeHtml(b.kismet_source.uuid)}">Stop</button>`;
+      } else if (!b.powered) {
+        status = '<span class="badge" style="background:var(--warn);color:#000">powered off</span>';
+        action = '<span style="color:var(--muted)">power on first</span>';
+      } else {
+        status = '<span class="badge" style="background:var(--accent);color:#fff">available</span>';
+        action = `<button class="btn-add" data-def="${escapeHtml(b.suggested_source)}">Add to Kismet</button>`;
+      }
+      const defBadge = b.default ? '<span class="badge" style="background:var(--good);color:#fff">default</span>' : '';
+      return `<tr>
+        <td><b>${escapeHtml(b.hci || '?')}</b> ${defBadge}</td>
+        <td class="mac">${escapeHtml(b.mac)}</td>
+        <td>${escapeHtml(b.name || '—')}</td>
+        <td>${status}</td>
+        <td>${action}</td>
+      </tr>`;
+    }).join('');
+
+    let html = '';
+    html += '<h3 style="margin:8px 0 6px;font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.05em">📡 WiFi adapters</h3>';
+    if (wifi.length) {
+      html += '<table class="compact"><thead><tr>' +
+              '<th>Interface</th><th>MAC</th><th>Mode</th><th>Capabilities</th><th>Status</th><th>Action</th>' +
+              '</tr></thead><tbody>' + wifiRows + '</tbody></table>';
+    } else {
+      html += '<div class="empty">No WiFi adapters detected (is `iw` installed?).</div>';
+    }
+    html += '<h3 style="margin:14px 0 6px;font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.05em">🔵 Bluetooth controllers</h3>';
+    if (bt.length) {
+      html += '<table class="compact"><thead><tr>' +
+              '<th>Controller</th><th>BD Address</th><th>Name</th><th>Status</th><th>Action</th>' +
+              '</tr></thead><tbody>' + btRows + '</tbody></table>';
+    } else {
+      html += '<div class="empty">No Bluetooth controllers detected.</div>';
+    }
+    html += `<div style="margin-top:10px;font-size:11px;color:var(--muted)">
+      Tip: changes here are <b>live but not persistent</b>. To make a source survive
+      Kismet restarts, append the <code>source=…</code> line to <code>/etc/kismet/kismet_site.conf</code>
+      and run <code>sudo systemctl restart kismet</code>.
+    </div>`;
+    document.getElementById('sources-panel').innerHTML = html;
+
+    // Wire buttons
+    document.querySelectorAll('#sources-panel .btn-add').forEach(b => {
+      b.addEventListener('click', async () => {
+        b.disabled = true; b.textContent = 'adding…';
+        const def = b.dataset.def;
+        try {
+          const r = await fetch('/api/sources/add', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({definition: def}),
+          });
+          const j = await r.json();
+          if (j.ok) {
+            b.textContent = 'added ✓'; b.style.background = 'var(--good)';
+            navigator.clipboard?.writeText(def).catch(()=>{});
+            setTimeout(renderSources, 2000);
+          } else {
+            b.textContent = 'failed';
+            alert('Kismet rejected the source:\n\n' + (j.error || j.kismet_response || 'unknown'));
+            b.disabled = false; b.textContent = 'Add to Kismet';
+          }
+        } catch (e) {
+          b.textContent = 'error'; alert(e.message);
+        }
+      });
+    });
+    document.querySelectorAll('#sources-panel .btn-stop').forEach(b => {
+      b.addEventListener('click', async () => {
+        if (!confirm('Stop this Kismet source? Capture will halt until you re-add it.')) return;
+        b.disabled = true; b.textContent = 'stopping…';
+        try {
+          const r = await fetch('/api/sources/' + encodeURIComponent(b.dataset.uuid) + '/close', {method: 'POST'});
+          const j = await r.json();
+          if (j.ok) { setTimeout(renderSources, 1500); } else { alert('Failed: ' + (j.error || j.kismet_response)); }
+        } catch (e) { alert(e.message); }
+      });
+    });
+  } catch (e) {
+    console.warn('sources fetch failed', e);
+    document.getElementById('sources-panel').innerHTML = '<div class="empty">Source discovery failed: ' + escapeHtml(e.message) + '</div>';
+  }
+}
+
+// Buttons need a touch of styling
+const _btnStyle = document.createElement('style');
+_btnStyle.textContent = `
+  #sources-panel button {
+    background: var(--accent); color:#fff; border:0; padding:3px 10px;
+    border-radius:3px; font:inherit; font-size:11px; cursor:pointer;
+  }
+  #sources-panel button:disabled { opacity:.5; cursor:not-allowed; }
+  #sources-panel button.btn-stop { background: var(--bad); }
+  #sources-panel button:hover:not(:disabled) { filter: brightness(1.15); }
+  #sources-panel code { background: var(--bg); padding:1px 5px; border-radius:3px; }
+`;
+document.head.appendChild(_btnStyle);
+
 async function renderOperators() {
   try {
     const r = await fetch('/api/operators');
@@ -1488,8 +1906,10 @@ async function refresh() {
 document.getElementById('poll-secs').textContent = (POLL_MS/1000).toFixed(0);
 refresh();
 renderOperators();
+renderSources();
 setInterval(refresh, POLL_MS);
-setInterval(renderOperators, 15000); // operators panel refreshes slower
+setInterval(renderOperators, 15000);  // operators panel refreshes slower
+setInterval(renderSources, 30000);    // sources panel refreshes slowest
 </script>
 </body>
 </html>
