@@ -76,6 +76,24 @@ DRONE_MANUF_RE = re.compile(
     r"(?i)\b(DJI|Parrot|Skydio|Autel|Yuneec|Hubsan|Ryze|3D ?Robotics|FIMI|Propel|Wing|Manna|Skyports)\b"
 )
 
+# SSIDs that look drone-y but almost certainly aren't — strips false positives
+# from car infotainment systems, hotel WiFi, phone hotspots, and consumer-AV
+# devices that share substring patterns with drone naming conventions.
+# Examples that bit us:
+#   "MINI81484 CarPlay"  ← BMW Mini Cooper, Texas Instruments WiFi chip
+#   "Audi MMI ..."       ← Audi infotainment
+EXCLUDE_SSID_RE = re.compile(
+    r"(?i)\b("
+    r"CarPlay|AndroidAuto|Apple\s*CarPlay|"
+    r"MyBMW|BMW[-_\s]\d|Audi[-_\s]MMI|Mercedes(?!\s+benz\s+drone)|"
+    r"Tesla\s*Model|Volvo|Ford\s*Sync|Toyota|Hyundai|Kia|"
+    r"Lexus|Honda|Nissan|Renault|Peugeot|Vauxhall|Citro|Fiat|"
+    r"Hotspot|Tether|"
+    r"Premier\s*Inn|Travelodge|Hilton|Marriott|Sheraton|Holiday\s*Inn|Hotel[-_]|"
+    r"iPhone|iPad|MacBook|AirPort|Apple\s*TV"
+    r")\b"
+)
+
 # -----------------------------------------------------------------------------
 # Bluetooth identification helpers
 # Kismet's BT helper passively listens; manufacturer-data parsing is limited.
@@ -631,10 +649,11 @@ _state = {
     "kismet_error": None,
     "last_poll": None,
     "drones": [],
+    "possible_drones": [],
     "wifi_clients": [],
     "bt_devices": [],
     "map_targets": [],
-    "totals": {"drones": 0, "wifi_clients": 0, "bt_devices": 0, "aps_skipped": 0, "all": 0},
+    "totals": {"drones": 0, "possible_drones": 0, "wifi_clients": 0, "bt_devices": 0, "aps_skipped": 0, "all": 0},
     "stats": {"polls": 0, "errors": 0, "started_at": time.time()},
 }
 _drone_history = deque(maxlen=HISTORY_LEN)
@@ -763,29 +782,52 @@ def extract_locations(d):
 # classification
 
 def is_drone(d):
-    """Multi-signal drone classifier. Returns (is_drone, reason, details)."""
-    # 1. Kismet's own UAV match (best signal)
-    uav = d.get("uav_match") or d.get("dot11.device.uav") or d.get("bluetooth.device.uav") or d.get("kismet.device.base.uav")
+    """3-tier confidence classifier. Returns (confidence, reason, details).
+    confidence ∈ {"HIGH", "MEDIUM", "LOW", None}:
+      HIGH   — Kismet uav_match fired (MAC+SSID joint), Operator ID present,
+               OR drone-OEM manuf OUI agrees with drone-pattern SSID
+      MEDIUM — drone-OEM manuf OUI alone (registered in IEEE — could be a
+               drone controller or accessory, not necessarily the airframe)
+      LOW    — SSID heuristic only, no OUI confirmation (manual review)
+      None   — not a drone
+    """
+    ssid = (d.get("last_ssid") or "").strip()
+    manuf = (d.get("kismet.device.base.manuf") or "").strip()
+
+    # Excluded SSIDs short-circuit the heuristic path (cars, hotels, phones)
+    ssid_excluded = bool(ssid and EXCLUDE_SSID_RE.search(ssid))
+
+    # ---- HIGH: Kismet UAV phy match (uses MAC+SSID joint matching from kismet_uav.conf)
+    uav = (d.get("uav_match") or d.get("dot11.device.uav")
+           or d.get("bluetooth.device.uav") or d.get("kismet.device.base.uav"))
     if uav and isinstance(uav, dict) and uav:
         name = uav.get("dot11.device.uav.name") or uav.get("name") or "Unknown"
         model = uav.get("dot11.device.uav.model") or uav.get("model") or ""
         match = uav.get("dot11.device.uav.match_name") or uav.get("match_name") or ""
-        return True, "uav_match", f"{name} {model}".strip() or match or "UAV"
+        return "HIGH", "uav_match", f"{name} {model}".strip() or match or "UAV"
 
-    ssid = (d.get("last_ssid") or "").strip()
-    manuf = (d.get("kismet.device.base.manuf") or "").strip()
+    oui_match = bool(manuf and DRONE_MANUF_RE.search(manuf))
+    ssid_match = bool(ssid and not ssid_excluded and DRONE_SSID_RE.search(ssid))
 
-    if ssid and DRONE_SSID_RE.search(ssid):
-        return True, "ssid_pattern", f"SSID: {ssid}"
+    # ---- HIGH: drone-OEM OUI AND drone-pattern SSID — both signals agree
+    if oui_match and ssid_match:
+        return "HIGH", "oui+ssid", f"{manuf} | {ssid}"
 
-    if manuf and DRONE_MANUF_RE.search(manuf):
-        return True, "manuf_pattern", f"Manuf: {manuf}"
+    # ---- MEDIUM: drone-OEM OUI alone (could be a controller/transmitter, not the airframe)
+    if oui_match:
+        extra = f" | {ssid}" if ssid else ""
+        return "MEDIUM", "manuf_only", f"Manuf: {manuf}{extra}"
 
-    return False, None, None
+    # ---- LOW: SSID heuristic only, no OUI confirmation
+    if ssid_match:
+        return "LOW", "ssid_only", f"SSID: {ssid}"
+
+    return None, None, None
 
 
 def classify(devices):
     drones = []
+    possible_drones = []
     wifi_clients = []
     bt_devices = []
     aps_skipped = 0
@@ -804,17 +846,26 @@ def classify(devices):
         # Pull GPS for ANY device — even non-drones
         locations = extract_locations(d)
 
-        drone_flag, reason, details = is_drone(d)
-        if drone_flag:
+        confidence, reason, details = is_drone(d)
+        if confidence:
+            d["_drone_confidence"] = confidence
             d["_drone_reason"] = reason
             d["_drone_details"] = details
             d["_locations"] = locations
 
-            # Extract Remote ID metadata: operator_id, self_id, drone serial
+            # Extract RID metadata for any tier — Operator ID auto-promotes to HIGH
             uav_meta = extract_uav_metadata(d)
             opid_raw = uav_meta.get("operator_id")
             self_id_text = uav_meta.get("self_id")
-            drone_serial = uav_meta.get("drone_serial") or uav_meta.get("basic_id") or uav_meta.get("uas_id")
+            drone_serial = (uav_meta.get("drone_serial")
+                            or uav_meta.get("basic_id")
+                            or uav_meta.get("uas_id"))
+
+            # An Operator ID broadcast is regulator-mandated for drones — it's
+            # definitive. Promote to HIGH no matter what tier the heuristics gave.
+            if opid_raw:
+                confidence = "HIGH"
+                d["_drone_confidence"] = "HIGH"
 
             opid_parsed = parse_operator_id(opid_raw) if opid_raw else None
             label, category = match_known_operator(self_id_text or "", opid_raw or "")
@@ -826,8 +877,9 @@ def classify(devices):
             d["_known_category"] = category
             d["_drone_serial"] = drone_serial
 
-            # Persist + maybe notify (only when we have a real Operator ID)
-            if opid_raw:
+            # Persist to SQLite + ntfy ONLY for HIGH-confidence detections.
+            # Avoids polluting the operator log with BMW Mini false positives.
+            if confidence == "HIGH" and opid_raw:
                 try:
                     drone_lat = next((l["lat"] for l in locations if l["kind"] == "drone"), None)
                     drone_lon = next((l["lon"] for l in locations if l["kind"] == "drone"), None)
@@ -849,23 +901,28 @@ def classify(devices):
                 except Exception as e:
                     log.warning("operator persist failed for %s: %s", opid_raw, e)
 
-            drones.append(d)
-            for loc in locations:
-                kind = loc["kind"] if loc["kind"] in ("drone", "operator") else "drone"
-                map_targets.append({
-                    "kind": kind, "lat": loc["lat"], "lon": loc["lon"],
-                    "alt": loc.get("alt"),
-                    "label": details, "mac": mac,
-                    "manuf": d.get("kismet.device.base.manuf", ""),
-                    "ssid": d.get("last_ssid", ""),
-                    "rssi": d.get("last_signal"),
-                    "last_time": d.get("kismet.device.base.last_time"),
-                    "operator_id": opid_raw,
-                    "known_label": label,
-                })
-            if mac not in _drone_ever_seen:
-                _drone_ever_seen[mac] = d.get("kismet.device.base.first_time") or int(now)
-                _drone_history.append((int(now), mac, details or "drone"))
+            # HIGH → main Drones panel + map markers + history
+            # MEDIUM/LOW → "Possible Drones" panel only (no map / no notifications)
+            if confidence == "HIGH":
+                drones.append(d)
+                for loc in locations:
+                    kind = loc["kind"] if loc["kind"] in ("drone", "operator") else "drone"
+                    map_targets.append({
+                        "kind": kind, "lat": loc["lat"], "lon": loc["lon"],
+                        "alt": loc.get("alt"),
+                        "label": details, "mac": mac,
+                        "manuf": d.get("kismet.device.base.manuf", ""),
+                        "ssid": d.get("last_ssid", ""),
+                        "rssi": d.get("last_signal"),
+                        "last_time": d.get("kismet.device.base.last_time"),
+                        "operator_id": opid_raw,
+                        "known_label": label,
+                    })
+                if mac not in _drone_ever_seen:
+                    _drone_ever_seen[mac] = d.get("kismet.device.base.first_time") or int(now)
+                    _drone_history.append((int(now), mac, details or "drone"))
+            else:
+                possible_drones.append(d)
             continue
 
         if dtype == "Wi-Fi AP":
@@ -902,9 +959,10 @@ def classify(devices):
             })
 
     drones.sort(key=lambda x: x.get("kismet.device.base.last_time", 0), reverse=True)
+    possible_drones.sort(key=lambda x: x.get("kismet.device.base.last_time", 0), reverse=True)
     wifi_clients.sort(key=lambda x: x.get("kismet.device.base.last_time", 0), reverse=True)
     bt_devices.sort(key=lambda x: x.get("kismet.device.base.last_time", 0), reverse=True)
-    return drones, wifi_clients[:80], bt_devices[:80], aps_skipped, map_targets
+    return drones, possible_drones, wifi_clients[:80], bt_devices[:80], aps_skipped, map_targets
 
 
 # -----------------------------------------------------------------------------
@@ -920,17 +978,19 @@ def poller_loop():
             )
             r.raise_for_status()
             devices = r.json()
-            drones, wifi_clients, bt_devices, aps_skipped, map_targets = classify(devices)
+            drones, possible_drones, wifi_clients, bt_devices, aps_skipped, map_targets = classify(devices)
             with _state_lock:
                 _state["kismet_ok"] = True
                 _state["kismet_error"] = None
                 _state["last_poll"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
                 _state["drones"] = drones
+                _state["possible_drones"] = possible_drones
                 _state["wifi_clients"] = wifi_clients
                 _state["bt_devices"] = bt_devices
                 _state["map_targets"] = map_targets
                 _state["totals"] = {
                     "drones": len(drones),
+                    "possible_drones": len(possible_drones),
                     "wifi_clients": len(wifi_clients),
                     "bt_devices": len(bt_devices),
                     "aps_skipped": aps_skipped,
@@ -965,6 +1025,7 @@ def api_devices():
             "kismet_error": _state["kismet_error"],
             "last_poll": _state["last_poll"],
             "drones": _state["drones"],
+            "possible_drones": _state["possible_drones"],
             "wifi_clients": _state["wifi_clients"],
             "bt_devices": _state["bt_devices"],
             "map_targets": _state["map_targets"],
@@ -1386,8 +1447,13 @@ TEMPLATE = r"""
 <main>
 
   <section class="full">
-    <h2>🚁 Drones <span class="count drone zero" id="drone-count">0</span></h2>
+    <h2>🚁 Drones <span class="count drone zero" id="drone-count">0</span> <span style="font-weight:normal; text-transform:none; color:var(--muted); font-size:11px;">(HIGH confidence — Remote ID, Kismet UAV match, or OEM-OUI + drone SSID)</span></h2>
     <div id="drone-list"><div class="empty">No drones detected yet — Kismet is sweeping (WiFi + BT5).</div></div>
+  </section>
+
+  <section class="full">
+    <h2>⚠️ Possible Drones <span class="count zero" id="possible-count">0</span> <span style="font-weight:normal; text-transform:none; color:var(--muted); font-size:11px;">(MEDIUM/LOW — flagged by single weak signal, manual review — won't trigger notifications)</span></h2>
+    <div id="possible-list"><div class="empty">No suspect devices.</div></div>
   </section>
 
   <section class="full">
@@ -1542,6 +1608,41 @@ function fmtFreq(hz) {
 function escapeHtml(s) {
   return String(s ?? '').replace(/[&<>"']/g, c =>
     ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+function confidenceBadge(c) {
+  const colour = c === 'HIGH' ? 'var(--good)' : c === 'MEDIUM' ? 'var(--warn)' : 'var(--muted)';
+  const text = c || '?';
+  const fg = c === 'MEDIUM' ? '#000' : '#fff';
+  return `<span class="badge" style="background:${colour};color:${fg}">${text}</span>`;
+}
+
+function renderPossibleDrones(possible) {
+  const el = document.getElementById('possible-list');
+  document.getElementById('possible-count').textContent = possible.length;
+  document.getElementById('possible-count').classList.toggle('zero', possible.length === 0);
+  if (!possible.length) {
+    el.innerHTML = '<div class="empty">No suspect devices.</div>';
+    return;
+  }
+  el.innerHTML = '<table class="compact"><thead><tr>' +
+    ['Confidence','Why','MAC','Manuf','SSID','Channel','RSSI','Last seen']
+      .map(h=>`<th>${h}</th>`).join('') + '</tr></thead><tbody>' +
+    possible.map(d => {
+      const sig = d.last_signal;
+      const conf = d._drone_confidence || '?';
+      return `<tr>
+        <td>${confidenceBadge(conf)}</td>
+        <td><b>${escapeHtml(d._drone_details || '?')}</b><br>
+            <span style="color:var(--muted);font-size:10px">${escapeHtml(d._drone_reason || '')}</span></td>
+        <td class="mac">${escapeHtml(d['kismet.device.base.macaddr'])}</td>
+        <td>${escapeHtml(d['kismet.device.base.manuf'] || '—')}</td>
+        <td class="ssid">${escapeHtml(d.last_ssid || '—')}</td>
+        <td>${escapeHtml(d['kismet.device.base.channel'] || '—')}</td>
+        <td class="signal ${sigClass(sig)}">${sig ?? '—'}</td>
+        <td>${fmtRel(d['kismet.device.base.last_time'])}</td>
+      </tr>`;
+    }).join('') + '</tbody></table>';
 }
 
 function renderDrones(drones) {
@@ -1888,6 +1989,7 @@ async function refresh() {
       document.getElementById('status').textContent = 'kismet ok · last poll ' + (s.last_poll || '—');
     }
     renderDrones(s.drones || []);
+    renderPossibleDrones(s.possible_drones || []);
     document.getElementById('wifi-count').textContent = (s.wifi_clients||[]).length;
     document.getElementById('wifi-count').classList.toggle('zero', !(s.wifi_clients||[]).length);
     document.getElementById('bt-count').textContent = (s.bt_devices||[]).length;
